@@ -38,6 +38,7 @@
   },
   "scripts": {
     "test": "bun test test/",
+    "test:native": "node --test test/find.integration.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -94,12 +94,31 @@ Parameters:
 
 ### `fffind`
 
-Fuzzy file name search. Frecency-ranked.
+Fuzzy search over file paths, ordered by frecency. Path filters are strict.
 
 Parameters:
-- `pattern` — fuzzy query (e.g. `main.ts`, `src/ config`)
-- `path` — directory constraint
-- `limit` — max results (default: 200)
+- `pattern`: fuzzy query, such as `main.ts` or `src/ config`. Empty or `*` lists files.
+- `path`: directory prefix, exact filename, or glob. `src/**` stays inside `src/`.
+- `exclude`: comma- or space-separated filters, or an array. Braces in globs are preserved.
+- `limit`: results per page (default 30, maximum 1000).
+- `cursor`: continuation from the previous result. An unknown cursor is an error.
+
+Each result must contain all literal query terms or meet the minimum base score
+(14 points per character in the literal query terms). Bonuses for recent access cannot
+admit a weak match. Filtering occurs before pagination. The output reports the
+number of weak candidates omitted. Result details report `totalCandidates`,
+`totalFiles`, `shownCount`, `filteredCount`, and `hasMore`.
+
+Whitespace in a path constraint that reaches the native query is rejected,
+not interpreted as extra query terms. An external directory can be the root
+of a separate index. Grep and `@` completion behavior are unchanged.
+
+### Tests for file search
+
+`bun test test/` runs the tests with test doubles. `npm run test:native` runs the
+file search tests against the native Node package. The native tests need Node
+with TypeScript support and Git. `FFF_NATIVE_ENTRY` can select another installed
+Node binding by its absolute `dist/index.js` path.
 
 ### `fff-multi-grep`
 

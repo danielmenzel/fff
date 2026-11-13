@@ -73,6 +73,52 @@ export function normalizeExcludes(
   return out;
 }
 
+function normalizeFindConstraint(raw: string, cwd: string): string {
+  const normalized = normalizePathConstraint(raw.replaceAll("\\", "/"), cwd) ?? "**";
+  if (/\s/.test(normalized)) {
+    throw new Error("File search constraints cannot contain whitespace. Use a search rooted at that directory.");
+  }
+  if (/[*?[{]/.test(normalized)) return normalized;
+  if (normalized.endsWith("/")) return `${normalized}**`;
+  if (!normalized.includes("/")) return `**/${normalized}`;
+  const separator = normalized.lastIndexOf("/") + 1;
+  // A character class forces the native parser to use an exact glob.
+  return `${normalized.slice(0, separator)}[${normalized[separator]}]${normalized.slice(separator + 1)}`;
+}
+
+function splitFindExcludes(exclude: string | string[] | undefined): string[] {
+  const result: string[] = [];
+  for (const raw of typeof exclude === "string" ? [exclude] : exclude ?? []) {
+    let depth = 0;
+    let token = "";
+    for (const char of raw) {
+      if (char === "{" || char === "[") depth++;
+      if (char === "}" || char === "]") depth--;
+      if (depth === 0 && /[,\s]/.test(char)) {
+        if (token) result.push(token);
+        token = "";
+      } else token += char;
+    }
+    if (token) result.push(token);
+  }
+  return result;
+}
+
+export function buildFindQuery(
+  path: string | undefined,
+  pattern: string,
+  exclude?: string | string[],
+  cwd = process.cwd(),
+): string {
+  const parts: string[] = [];
+  if (path) parts.push(normalizeFindConstraint(path, cwd));
+  for (const item of splitFindExcludes(exclude)) {
+    parts.push(`!${normalizeFindConstraint(item.replace(/^!/, ""), cwd)}`);
+  }
+  parts.push(pattern.trim() === "*" ? "" : pattern);
+  return parts.join(" ");
+}
+
 export function buildQuery(
   path: string | undefined,
   pattern: string,

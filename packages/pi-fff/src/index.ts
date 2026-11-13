@@ -25,14 +25,14 @@ import type {
   GrepMode,
   GrepResult,
   MixedItem,
-  SearchResult,
 } from "@ff-labs/fff-node";
 import { Type, type TSchema } from "@sinclair/typebox";
 import { AuxFinderPool, routePathConstraint } from "./aux-finders";
 import { type FffMode, loadConfig, VALID_MODES } from "./config";
 import { FilePickerFactory } from "./file-picker";
 import { isFsRoot, isHomeDir, resolveDbPaths } from "./paths";
-import { buildQuery } from "./query";
+import { buildFindQuery, buildQuery } from "./query";
+import { collectFindPage } from "./find";
 
 export { SCAN_TIMEOUT_MS } from "./sdk";
 
@@ -106,14 +106,12 @@ function getCursor(id: string): GrepCursor | undefined {
   return cursorCache.get(id);
 }
 
-// Find pagination uses a page-index cursor: native `fileSearch` takes
-// pageIndex/pageSize, so the cursor is just the next page index paired with
-// the query+limit that produced it. Stored tokens are opaque IDs to the agent.
+// Cursors retain the first unconsumed native result after filtering.
 interface FindCursor {
   query: string;
   pattern: string;
   pageSize: number;
-  nextPageIndex: number;
+  nextOffset: number;
   auxRoot?: string;
 }
 
@@ -205,56 +203,6 @@ function formatGrepOutput(result: GrepResult): string {
   }
 
   return lines.join("\n");
-}
-
-// Weak-match threshold is derived from the query length, matching the
-// scoring formula in crates/fff-core/src/score.rs: a perfect match scores
-// `len * 16`, so we treat anything below 50% of that as scattered fuzzy noise.
-// When the top score is weak, trim output to a small sample instead of dumping
-// the full limit worth of noise into the agent's context.
-const FIND_WEAK_SAMPLE_SIZE = 5;
-
-function weakScoreThreshold(pattern: string): number {
-  const perfect = pattern.length * 12;
-  return Math.floor((perfect * 50) / 100);
-}
-
-interface FormattedFind {
-  output: string;
-  weak: boolean;
-  shownCount: number;
-}
-
-function formatFindOutput(
-  result: SearchResult,
-  limit: number,
-  pattern: string,
-): FormattedFind {
-  if (result.items.length === 0) {
-    return {
-      output: "No files found matching pattern",
-      weak: false,
-      shownCount: 0,
-    };
-  }
-
-  // NO CUSTOM SORTING — trust native frecency order from the engine.
-  const reordered = result.items.map((item) => ({ item }));
-
-  // Peek at the top native score to decide whether results are scattered
-  // fuzzy noise (query length-scaled threshold from score.rs).
-  const topScore = result.scores[0]?.total ?? 0;
-  const weak = topScore < weakScoreThreshold(pattern);
-  const effective = weak ? Math.min(FIND_WEAK_SAMPLE_SIZE, limit) : limit;
-  const shown = reordered.slice(0, effective);
-
-  return {
-    output: shown
-      .map((p) => `${p.item.relativePath}${fffFileAnnotation(p.item)}`)
-      .join("\n"),
-    weak,
-    shownCount: shown.length,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +510,7 @@ export default function fffExtension(pi: ExtensionAPI) {
     pathParam: string | undefined,
     pattern: string,
     exclude: string | string[] | undefined,
+    queryBuilder = buildQuery,
   ): Promise<{ finder: FileFinderApi; query: string; root: string } | null> {
     const route = routePathConstraint(pathParam, activeCwd);
     if (!route) return null;
@@ -571,7 +520,7 @@ export default function fffExtension(pi: ExtensionAPI) {
     // constraint stays relative to the picker's actual root.
     const rebase = nodePath.relative(aux.root, route.root).replaceAll(nodePath.sep, "/");
     const suffix = [rebase, route.suffix].filter(Boolean).join("/");
-    const query = buildQuery(suffix || undefined, pattern, exclude, aux.root);
+    const query = queryBuilder(suffix || undefined, pattern, exclude, aux.root);
     return { finder: aux.finder, query, root: aux.root };
   }
 
@@ -1200,6 +1149,7 @@ export default function fffExtension(pi: ExtensionAPI) {
 
       // if resumed we use the same picker as before
       const resumed = params.cursor ? getFindCursor(params.cursor) : undefined;
+      if (params.cursor && !resumed) throw new Error("Invalid or expired file search cursor");
       const pool = auxPool;
       if (!pool) throw new Error("FFF auxiliary finder pool is not initialized");
       const aux = resumed
@@ -1209,67 +1159,48 @@ export default function fffExtension(pi: ExtensionAPI) {
               root: resumed.auxRoot,
             }
           : null
-        : await resolveFinderForPath(params.path, params.pattern, params.exclude);
+        : await resolveFinderForPath(params.path, params.pattern, params.exclude, buildFindQuery);
 
       const picker = aux ? aux.finder : await ensureFinder(activeCwd);
       const effectiveLimit = resumed
         ? resumed.pageSize
-        : Math.max(1, params.limit ?? DEFAULT_FIND_LIMIT);
+        : Math.max(1, Math.min(1000, Math.floor(params.limit ?? DEFAULT_FIND_LIMIT)));
 
       const query = resumed
         ? resumed.query
         : aux && "query" in aux
           ? (aux as { query: string }).query
-          : buildQuery(params.path, params.pattern, params.exclude, activeCwd);
+          : buildFindQuery(params.path, params.pattern, params.exclude, activeCwd);
 
       const pattern = resumed ? resumed.pattern : params.pattern;
-      const pageIndex = resumed?.nextPageIndex ?? 0;
       const auxRoot = resumed?.auxRoot ?? aux?.root;
-
-      const searchResult = picker.fileSearch(query, {
-        pageIndex,
-        pageSize: effectiveLimit,
-      });
-      if (!searchResult.ok) throw new Error(searchResult.error);
-
-      const result = searchResult.value;
-      const formatted = formatFindOutput(result, effectiveLimit, pattern);
-      let output = formatted.output;
-
-      // Infer hasMore: native fileSearch fills pageSize when more results
-      // exist, so if we got a full page AND totalMatched exceeds what we've
-      // shown so far there's another page to fetch.
-      const shownSoFar = pageIndex * effectiveLimit + result.items.length;
-      const hasMore =
-        result.items.length >= effectiveLimit && result.totalMatched > shownSoFar;
-
+      const result = await collectFindPage(
+        picker, query, pattern, effectiveLimit, resumed?.nextOffset, signal,
+      );
+      let output = result.items.map((item) => `${item.relativePath}${fffFileAnnotation(item)}`).join("\n")
+        || "No files found with a sufficient match score";
+      const hasMore = result.nextOffset !== undefined;
       const notices: string[] = [];
-      if (formatted.weak && formatted.shownCount > 0)
-        notices.push(
-          `Query "${pattern}" produced only weak scattered fuzzy matches. Output capped at ${formatted.shownCount}/${result.totalMatched}.`,
-        );
-
-      if (!formatted.weak && hasMore) {
-        const remaining = result.totalMatched - shownSoFar;
+      if (result.filteredCount > 0) notices.push(`${result.filteredCount} weak candidates omitted`);
+      if (result.nextOffset !== undefined) {
         const cursorId = storeFindCursor({
           query,
           pattern,
           pageSize: effectiveLimit,
-          nextPageIndex: pageIndex + 1,
+          nextOffset: result.nextOffset,
           auxRoot,
         });
-        notices.push(
-          `${remaining} more match${remaining === 1 ? "" : "es"} available. cursor="${cursorId}" to continue`,
-        );
+        notices.push(`More results available. cursor="${cursorId}" to continue`);
       }
 
       if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
       return {
         content: [{ type: "text", text: output }],
         details: {
-          totalMatched: result.totalMatched,
+          totalCandidates: result.totalCandidates,
           totalFiles: result.totalFiles,
-          pageIndex,
+          shownCount: result.items.length,
+          filteredCount: result.filteredCount,
           hasMore,
         },
       };

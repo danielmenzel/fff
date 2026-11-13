@@ -7,6 +7,7 @@ type MockFinder = {
   isDestroyed: boolean;
   waitForScan: ReturnType<typeof mock>;
   mixedSearch: ReturnType<typeof mock>;
+  fileSearch: ReturnType<typeof mock>;
   grep: ReturnType<typeof mock>;
   getScanProgress: ReturnType<typeof mock>;
   destroy: ReturnType<typeof mock>;
@@ -16,6 +17,7 @@ const createCalls: unknown[] = [];
 let finders: MockFinder[] = [];
 let mixedSearchImpl: ((query: string, options: unknown) => unknown) | undefined;
 let grepImpl: ((query: string, options: unknown) => unknown) | undefined;
+let fileSearchImpl: ((query: string, options: any) => unknown) | undefined;
 let scanProgressImpl: (() => unknown) | undefined;
 
 function createMockFinder(): MockFinder {
@@ -46,6 +48,10 @@ function createMockFinder(): MockFinder {
           totalDirs: 0,
         },
       };
+    }),
+    fileSearch: mock((query: string, options: any) => {
+      if (fileSearchImpl) return fileSearchImpl(query, options);
+      return { ok: true, value: { items: [], scores: [], totalMatched: 0, totalFiles: 0 } };
     }),
     grep: mock((query: string, options: unknown) => {
       if (grepImpl) return grepImpl(query, options);
@@ -244,6 +250,7 @@ const configPath = path.join(agentDir, "pi-fff.json");
 beforeEach(() => {
   createCalls.length = 0;
   finders = [];
+  fileSearchImpl = undefined;
   mixedSearchImpl = undefined;
   grepImpl = undefined;
   scanProgressImpl = undefined;
@@ -953,6 +960,94 @@ describe("compact tool rendering", () => {
 
     const expanded = tool.renderResult({ content }, { expanded: true }, theme, context);
     expect(expanded.text).toBe("src/index.ts\nsrc/main.ts");
+  });
+});
+
+describe("fffind strict filters", () => {
+  async function findTool() {
+    const setup = await start("tools-and-ui");
+    return setup.pi.registerTool.mock.calls.map(([tool]) => tool)
+      .find((tool) => tool.name === "fffind");
+  }
+
+  function candidates(rows: { path: string; baseScore: number; total?: number }[]) {
+    fileSearchImpl = (_query, options) => {
+      // The C API passes pageIndex directly to PaginationArgs.offset.
+      const page = rows.slice(options.pageIndex, options.pageIndex + options.pageSize);
+      return { ok: true, value: {
+        items: page.map((row) => ({ relativePath: row.path, gitStatus: "clean" })),
+        scores: page.map((row) => ({ baseScore: row.baseScore, total: row.total ?? row.baseScore })),
+        totalMatched: rows.length, totalFiles: rows.length,
+      } };
+    };
+  }
+
+  test("keeps recursive directory filters strict, including exclusions", async () => {
+    const tool = await findTool();
+    await tool.execute("find", {
+      pattern: "", path: "SKY_DataDisplay/Viewer/cppunit/**", exclude: "ext/",
+    });
+    expect(finders[0].fileSearch.mock.calls[0][0]).toBe(
+      "SKY_DataDisplay/Viewer/cppunit/** !ext/** ",
+    );
+  });
+
+  test("keeps filters strict when an external index is reused", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fff-external-filter-"));
+    fs.mkdirSync(path.join(root, "Viewer", "cppunit"), { recursive: true });
+    const tool = await findTool();
+    try {
+      await tool.execute("root", { pattern: "", path: root });
+      await tool.execute("child", { pattern: "", path: `${root}/Viewer/cppunit/**` });
+      expect(finders.length).toBe(2);
+      expect(finders[1].fileSearch.mock.calls[1][0]).toBe("Viewer/cppunit/** ");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("removes weak results even after a strong result or a high frecency score", async () => {
+    candidates([
+      { path: "Viewer/CurveNameLessComparatorTest.cpp", baseScore: 396 },
+      { path: "GMC/MOIMeasurementListGraphicsSetComparator.cpp", baseScore: 266, total: 5000 },
+      { path: "Viewer/CurveNameLessComparatorTest.h", baseScore: 396 },
+    ]);
+    const result = await (await findTool()).execute("find", { pattern: "CurveNameLessComparator" });
+    expect(result.content[0].text).toContain("CurveNameLessComparatorTest.cpp");
+    expect(result.content[0].text).toContain("CurveNameLessComparatorTest.h");
+    expect(result.content[0].text).not.toContain("MOIMeasurement");
+    expect(result.content[0].text).toContain("weak");
+  });
+
+  test("fills pages after filtering and resumes without losing or repeating a result", async () => {
+    candidates([
+      ...Array.from({ length: 205 }, (_, i) => ({ path: `unrelated/${i}.cpp`, baseScore: 10 })),
+      { path: "Viewer/first.cpp", baseScore: 108 },
+      { path: "Viewer/second.cpp", baseScore: 108 },
+    ]);
+    const tool = await findTool();
+    const first = await tool.execute("first", { pattern: "Viewer", limit: 1 });
+    expect(first.content[0].text).toContain("Viewer/first.cpp");
+    expect(first.content[0].text).not.toContain("unrelated/");
+    const cursor = first.content[0].text.match(/cursor="([^"]+)"/)?.[1];
+    expect(cursor).toBeDefined();
+    const second = await tool.execute("second", { pattern: "ignored", cursor });
+    expect(second.content[0].text).toContain("Viewer/second.cpp");
+    expect(second.content[0].text).not.toContain("Viewer/first.cpp");
+    expect(second.details.hasMore).toBe(false);
+  });
+
+  test("keeps zero-score results for a directory listing", async () => {
+    candidates([{ path: "Viewer/main.cpp", baseScore: 0 }]);
+    for (const pattern of ["", "*"]) {
+      const result = await (await findTool()).execute("find", { pattern, path: "Viewer/" });
+      expect(result.content[0].text).toContain("Viewer/main.cpp");
+    }
+  });
+
+  test("rejects an unknown cursor rather than starting a different search", async () => {
+    await expect((await findTool()).execute("find", { pattern: "Viewer", cursor: "unknown" }))
+      .rejects.toThrow("cursor");
   });
 });
 
